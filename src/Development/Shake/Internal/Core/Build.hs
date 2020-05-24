@@ -72,8 +72,8 @@ getDatabaseValueGeneric k = do
 -- NEW STYLE PRIMITIVES
 
 -- | Lookup the value for a single Id, may need to spawn it
-lookupOne :: Global -> Stack -> Database -> Id -> Wait Locked (Either SomeException (Result (Value, BS_Store)))
-lookupOne global stack database i = do
+lookupOne :: Global -> Stack -> Database -> BuildMode -> Id -> Wait Locked (Either SomeException (Result (Value, BS_Store)))
+lookupOne global stack database buildMode i = do
     res <- quickly $ liftIO $ getKeyValueFromId database i
     case res of
         Nothing -> Now $ Left $ errorStructured "Shake Id no longer exists" [("Id", Just $ show i)] ""
@@ -89,20 +89,23 @@ lookupOne global stack database i = do
                     Running (NoShow w) r -> do
                         let w2 v = w v >> continue v
                         setMem database i k $ Running (NoShow w2) r
-                    Loaded r -> buildOne global stack database i k (Just r) `fromLater` continue
-                    Missing -> buildOne global stack database i k Nothing `fromLater` continue
+                    Loaded r -> buildOne global stack database buildMode i k (Just r) `fromLater` continue
+                    Missing -> buildOne global stack database buildMode i k Nothing `fromLater` continue
 
 
 -- | Build a key, must currently be either Loaded or Missing, changes to Waiting
-buildOne :: Global -> Stack -> Database -> Id -> Key -> Maybe (Result BS.ByteString) -> Wait Locked (Either SomeException (Result (Value, BS_Store)))
-buildOne global@Global{..} stack database i k r = case addStack i k stack of
+buildOne :: Global -> Stack -> Database -> BuildMode -> Id -> Key -> Maybe (Result BS.ByteString) -> Wait Locked (Either SomeException (Result (Value, BS_Store)))
+buildOne global@Global{..} stack database buildMode i k r = case addStack i k stack of
     Left e -> do
         quickly $ setIdKeyStatus global database i k $ mkError e
         pure $ Left e
     Right stack -> Later $ \continue -> do
         setIdKeyStatus global database i k (Running (NoShow continue) r)
         let go = buildRunMode global stack database r
-        fromLater go $ \mode -> liftIO $ addPool PoolStart globalPool $
+        let buildIt = case buildMode of
+                        BuildImmediately -> id
+                        BuildConcurrently -> addPool PoolStart globalPool
+        fromLater go $ \mode -> liftIO $ buildIt $
             runKey global stack k r mode $ \res -> do
                 runLocked database $ do
                     let val = fmap runValue res
@@ -133,11 +136,15 @@ buildRunMode global stack database me = do
 -- | Have the dependencies changed
 buildRunDependenciesChanged :: Global -> Stack -> Database -> Result a -> Wait Locked Bool
 buildRunDependenciesChanged global stack database me = isJust <$> firstJustM id
-    [firstJustWaitUnordered (fmap test . lookupOne global stack database) x | Depends x <- depends me]
+    [firstJustWaitUnordered (fmap test . lookupOne global stack database BuildConcurrently) x | Depends x <- depends me]
     where
         test (Right dep) | changed dep <= built me = Nothing
         test _ = Just ()
 
+-- | Whether we want to build call the builder immediately or rather spawn a
+-- thread to do so. The former is beneficial if we have only one thing to build
+-- as we avoid the issues like GHC #18224.
+data BuildMode = BuildImmediately | BuildConcurrently
 
 ---------------------------------------------------------------------
 -- ACTUAL WORKERS
@@ -158,8 +165,11 @@ applyKeyValue callStack ks = do
     let database = globalDatabase
     (is, wait) <- liftIO $ runLocked database $ do
         is <- mapM (mkId database) ks
+        let buildMode = case is of
+                          [_] -> BuildImmediately
+                          _   -> BuildConcurrently
         wait <- runWait $ do
-            x <- firstJustWaitUnordered (fmap (either Just (const Nothing)) . lookupOne global stack database) $ nubOrd is
+            x <- firstJustWaitUnordered (fmap (either Just (const Nothing)) . lookupOne global stack database buildMode) $ nubOrd is
             case x of
                 Just e -> pure $ Left e
                 Nothing -> quickly $ Right <$> mapM (fmap (\(Just (_, Ready r)) -> fst $ result r) . liftIO . getKeyValueFromId database) is
@@ -264,7 +274,7 @@ historyLoad (Ver -> ver) = do
             let ask k = do
                     i <- quickly $ mkId database k
                     let identify = runIdentify globalRules k . fst . result
-                    either (const Nothing) identify <$> lookupOne global localStack database i
+                    either (const Nothing) identify <$> lookupOne global localStack database BuildConcurrently i
             x <- case globalShared of
                 Nothing -> pure Nothing
                 Just shared -> lookupShared shared ask key localBuiltinVersion ver
